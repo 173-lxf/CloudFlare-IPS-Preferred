@@ -11,7 +11,7 @@ TIMEOUT = 1.5
 THREADS = 150
 
 TEST_TIMES = 2          # 每IP测试次数（终极版降低次数提升整体速度）
-MAX_IPS = 200000          # 最大扫描IP数
+MAX_IPS = 4000          # 最大扫描IP数
 MAX_LOSS = 0.5          # 最大丢包率
 TOP_N = 100             # 输出最优数量
 
@@ -140,3 +140,4 @@ for ip, tcp, tls, ttfb, speed, loss in results[:TOP_N]:
 print("\n=========================================")
 print(f"完成，用时 {round(time.time() - start_time, 1)} 秒")
 print(f"有效 IP：{len(results)}")
+
