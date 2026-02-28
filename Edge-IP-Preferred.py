@@ -12,20 +12,19 @@ from concurrent.futures import ThreadPoolExecutor,as_completed
 
 
 PORT = 443
-TIMEOUT = 0.3
+TIMEOUT = 1
 TEST_TIMES = 2
 MAX_LOSS = 0.3
 
 DOWNLOAD_SIZE = 200 * 1024
-HOST = "cloudflare.com"
+HOST = "speed.cloudflare.com"
 
-#exe路径
+#exe路径 .py__file__
 BASE_DIR = os.path.dirname(sys.executable)
-file_v4path = os.path.join(BASE_DIR,'ipv4.txt')
-file_v6path = os.path.join(BASE_DIR,'ipv6.txt')
+file_v4path = os.path.join(BASE_DIR, 'ipv4.txt')
 
 config = configparser.ConfigParser()
-config_path = os.path.join(BASE_DIR,'config.ini')
+config_path = os.path.join(BASE_DIR, 'config.ini')
 config.read(config_path,encoding='utf8')
 MAX_IPS = int(config['settings']['MAX_IPS'])
 MAX_NUMBER = int(config['settings']['MAX_NUMBER'])
@@ -52,9 +51,6 @@ def expand(file_path):
                             continue
                         start = int(network.network_address) + 1
                         end = int(network.broadcast_address) - 1
-                    elif isinstance(network,ipaddress.IPv6Network) : # IPv6
-                        if network.prefixlen <= 24 :
-                            continue
                         usable_ips = network.num_addresses
                         start = int(network.network_address)
                         end = int(network.broadcast_address)
@@ -67,6 +63,7 @@ def expand(file_path):
                         selected.add(str(ipaddress.ip_address(rand_ip)))
 
                     ips.extend(selected)
+
                 except ValueError as e:
                     print(f"跳过无效CIDR {cidr}：{e}")
     except Exception as e:
@@ -80,64 +77,66 @@ def speed_test(ip):
     tls_list = []
     ttfb_list = []
     speed_list = []
-    fail = 0
+    tcp_fail = 0
 
     for _ in range(TEST_TIMES):
 
         sock = None
         ssock = None
         try:
-            #------TCP------
+            #------TCP 测延迟（必须成功）------
             t0 = time.perf_counter()
-            sock =socket.create_connection((ip,PORT),timeout=TIMEOUT)
+            sock = socket.create_connection((ip, PORT), timeout=TIMEOUT)
             tcp = (time.perf_counter() - t0) * 1000
             tcp_list.append(tcp)
 
+            # ------TLS + 下载测速（可选，失败不影响结果）------
+            try:
+                ssock = ctx.wrap_socket(
+                    sock,
+                    server_hostname=HOST,
+                    do_handshake_on_connect=False)
+                ssock.settimeout(TIMEOUT)
 
-            # ------TLS------
-            ssock = ctx.wrap_socket(
-                sock,
-                server_hostname=HOST,
-                do_handshake_on_connect=False)
-            ssock.settimeout(TIMEOUT)
+                t1 = time.perf_counter()
+                ssock.do_handshake()
+                tls = (time.perf_counter() - t1) * 1000
+                tls_list.append(tls)
 
-            t1 = time.perf_counter()
-            ssock.do_handshake()
-            tls = (time.perf_counter() - t1) * 1000
-            tls_list.append(tls)
+                # ------TTFB------
+                request = (
+                    f"GET /__down?bytes={DOWNLOAD_SIZE} HTTP/1.1\r\n"
+                    f"Host: {HOST}\r\n"
+                    f"Connection: close\r\n\r\n"
+                )
 
-            # ------TTFB------
-            request = (
-                f"GET /cdn-cgi/trace HTTP/1.1\r\n"
-                f"Host: {HOST}\r\n"
-                f"Connection: close\r\n\r\n"
-            )
+                t2 = time.perf_counter()
+                ssock.sendall(request.encode())
+                first_byte = ssock.recv(1)
+                ttfb = ((time.perf_counter() - t2)) * 1000
+                ttfb_list.append(ttfb)
 
-            t2 = time.perf_counter()
-            ssock.sendall(request.encode())
-            first_byte = ssock.recv(1)
-            ttfb = ((time.perf_counter() - t2)) * 1000
-            ttfb_list.append(ttfb)
+                # ------DOWNLOAD_SPEED-----
+                total = len(first_byte)
+                start_dl = time.perf_counter()
 
+                while total < DOWNLOAD_SIZE:
+                    chunk = ssock.recv(8192)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                duration = time.perf_counter() - start_dl
+                if duration > 0:
+                    speed = total / duration / (1024 * 1024)
+                    speed_list.append(speed)
 
-            # ------DOWNLOAD_SPEED-----
-            total = len(first_byte)
-            start_dl = time.perf_counter()
+            except Exception:
+                # TLS/下载失败，但 TCP 已成功，继续保留该 IP
+                pass
 
-            while total < DOWNLOAD_SIZE:
-                chunk = ssock.recv(4096)
-                if not chunk:
-                    break
-                total += len(chunk)
-            duration = time.perf_counter() - start_dl
-            if duration > 0:
-                speed = total / duration / (1024 * 1024)
-                speed_list.append(speed)
-
-
-        except Exception :
-            fail += 1
-            if fail >= TEST_TIMES:
+        except Exception:
+            tcp_fail += 1
+            if tcp_fail >= TEST_TIMES:
                 return None
         finally:
             if ssock:
@@ -145,20 +144,18 @@ def speed_test(ip):
             if sock:
                 sock.close()
 
-    success = TEST_TIMES - fail
-    if success == 0 :
+    if not tcp_list:
         return None
 
-    loss = fail / TEST_TIMES
-    if loss > MAX_LOSS or not tcp_list:
+    loss = tcp_fail / TEST_TIMES
+    if loss > MAX_LOSS:
         return None
-
 
     return (
         ip,
         round(sum(tcp_list) / len(tcp_list), 1),
-        round(sum(tls_list) / len(tls_list), 1),
-        round(sum(ttfb_list) / len(ttfb_list), 1),
+        round(sum(tls_list) / len(tls_list), 1) if tls_list else 0,
+        round(sum(ttfb_list) / len(ttfb_list), 1) if ttfb_list else 0,
         round(sum(speed_list) / len(speed_list), 2) if speed_list else 0,
         round(loss, 2),
     )
@@ -168,11 +165,11 @@ def speed_test(ip):
 
 if __name__ =='__main__':
     print('正在运行，请稍后...')
-    expand_ips = expand(file_v4path) + expand(file_v6path)
+    expand_ips = expand(file_v4path)
     expand_ips =expand_ips[:MAX_IPS]
 
     if len(expand_ips) == 0:
-        print('\n错误：未生成任何有效IP地址，请检查 ipv4.txt 和 ipv6.txt 文件！')
+        print('\n错误：未生成任何有效IP地址，请检查 ipv4.txt！')
         input('\n按回车键退出程序')
         sys.exit(1)
 
@@ -195,14 +192,15 @@ if __name__ =='__main__':
                 tqdm.write(
                     f"[OK] {ip:15} "
                     f"TCP:{tcp:5}ms TLS:{tls:5}ms "
-                    f"TTFB:{ttfb:5}ms SPD:{speed:5.1}MB/s "
+                    f"TTFB:{ttfb:5}ms SPD:{speed:5}MB/s "
                     f"LOSS:{loss}"
                 )
                 results.append(r)
 
 
     # ===== 排序=====
-    results.sort(key=lambda x: (x[5], x[3] + x[2], -x[4], x[1]))
+    # 排序: 丢包率 → TCP延迟 → 速度(降序)
+    results.sort(key=lambda x: (x[5], x[1], -x[4]))
 
     if TOP_N > len(results):
         TOP_N = len(results)
